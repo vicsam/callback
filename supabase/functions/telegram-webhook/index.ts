@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { getTokenStats, shortenAddress } from "./_shared/dexscreener.ts";
 import { escapeMarkdown, formatCompactNumber, formatPercent, formatPrice } from "./_shared/format.ts";
+import { getCallPerformance } from "./_shared/performance.ts";
 
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const TELEGRAM_WEBHOOK_SECRET = Deno.env.get("TELEGRAM_WEBHOOK_SECRET")!;
@@ -290,13 +291,10 @@ function formatSecuritySection(risk: RugRiskData | null, chain: string): string 
 
 // --- Leaderboard -----------------------------------------------------------
 //
-// "Performance" for a call = % FDV change from its 'initial' snapshot to its
-// most recent data point: the 'followup' snapshot if the call has completed
-// its 24h cycle, or a live getTokenStats() call if it's still active (rather
-// than waiting on a stale initial-only reading). Calls with no initial FDV
-// (DexScreener had nothing at drop time) are skipped — nothing to measure.
 // Ranking is by each user's single BEST call, not average, so one user only
-// ever occupies one leaderboard slot.
+// ever occupies one leaderboard slot. Per-call performance is computed by
+// the shared getCallPerformance() (see _shared/performance.ts) — the same
+// function daily-digest uses, so the two never diverge.
 
 const LEADERBOARD_SIZE = 10;
 
@@ -321,44 +319,17 @@ async function buildLeaderboard(chatId: number): Promise<LeaderboardEntry[]> {
   for (const call of calls) {
     if (!call.dropped_by_username) continue;
 
-    const { data: initialSnapshot } = await supabase
-      .from("snapshots")
-      .select("fdv")
-      .eq("call_id", call.id)
-      .eq("snapshot_type", "initial")
-      .maybeSingle();
+    const performance = await getCallPerformance(supabase, call);
+    if (!performance) continue;
 
-    const fdvFrom = initialSnapshot?.fdv ?? null;
-    if (fdvFrom === null || fdvFrom === 0) continue; // nothing to measure against
-
-    let fdvTo: number | null = null;
-    let symbol = shortenAddress(call.ca_address);
-
-    if (call.status === "followed_up") {
-      const { data: followupSnapshot } = await supabase
-        .from("snapshots")
-        .select("fdv")
-        .eq("call_id", call.id)
-        .eq("snapshot_type", "followup")
-        .maybeSingle();
-      fdvTo = followupSnapshot?.fdv ?? null;
-    } else {
-      const stats = await getTokenStats(call.chain, call.ca_address);
-      fdvTo = stats?.fdv ?? null;
-      if (stats?.symbol) symbol = stats.symbol;
-    }
-
-    if (fdvTo === null) continue;
-
-    const changePct = ((fdvTo - fdvFrom) / fdvFrom) * 100;
     const existing = bestByUser.get(call.dropped_by_username);
-    if (!existing || changePct > existing.changePct) {
+    if (!existing || performance.changePct > existing.changePct) {
       bestByUser.set(call.dropped_by_username, {
         username: call.dropped_by_username,
-        changePct,
-        symbol,
-        fdvFrom,
-        fdvTo,
+        changePct: performance.changePct,
+        symbol: performance.symbol,
+        fdvFrom: performance.fdvFrom,
+        fdvTo: performance.fdvTo,
       });
     }
   }
