@@ -3,6 +3,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import { getTokenStats, shortenAddress } from "./_shared/dexscreener.ts";
 import { escapeMarkdown, formatCompactNumber, formatPercent, formatPrice } from "./_shared/format.ts";
 import { getCallPerformance } from "./_shared/performance.ts";
+import { type BlockscoutFallback, getBlockscoutFallback } from "./_shared/blockscout.ts";
 
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const TELEGRAM_WEBHOOK_SECRET = Deno.env.get("TELEGRAM_WEBHOOK_SECRET")!;
@@ -260,11 +261,26 @@ function formatFdvChange(from: number | null, to: number | null): string {
   return `$${fromLabel} → $${toLabel} (${change >= 0 ? "+" : ""}${change.toFixed(1)}%)`;
 }
 
-function formatSecuritySection(risk: RugRiskData | null, chain: string): string {
-  if (!risk) {
-    return "🔐 Security: no data available yet";
+// Dispatches between GoPlus (full coverage), Blockscout (partial fallback —
+// only when GoPlus has no coverage for this chain), and the plain "no data"
+// message (neither has coverage). GoPlus always takes priority when present;
+// Blockscout is never consulted otherwise, so this never overrides or
+// duplicates GoPlus data.
+function formatSecuritySection(
+  risk: RugRiskData | null,
+  blockscoutFallback: BlockscoutFallback | null,
+  chain: string,
+): string {
+  if (risk) {
+    return formatGoPlusSecuritySection(risk, chain);
   }
+  if (blockscoutFallback) {
+    return formatBlockscoutSecuritySection(blockscoutFallback);
+  }
+  return "🔐 Security: no data available yet";
+}
 
+function formatGoPlusSecuritySection(risk: RugRiskData, chain: string): string {
   const lines = ["🔐 Security"];
 
   if (chain === "solana") {
@@ -303,6 +319,34 @@ function formatSecuritySection(risk: RugRiskData | null, chain: string): string 
   if (risk.holderCount !== null) {
     lines.push(`Holders: ${formatCompactNumber(risk.holderCount)}`);
   }
+
+  return lines.join("\n");
+}
+
+// Clearly labeled as partial so no one mistakes Blockscout's limited signal
+// for GoPlus's full automated checks — Blockscout cannot detect honeypots,
+// mint/ownership-renounced status, LP locks, or buy/sell tax.
+function formatBlockscoutSecuritySection(fallback: BlockscoutFallback): string {
+  const lines = ["🔐 Security (partial — limited chain coverage)"];
+
+  if (fallback.contractVerified === null) {
+    lines.push(`Contract: n/a`);
+  } else {
+    lines.push(`Contract: ${fallback.contractVerified ? "Verified ✅" : "Unverified ⚠️"}`);
+  }
+
+  if (fallback.top10HolderPct === null) {
+    lines.push(`Top 10 Holders: n/a`);
+  } else {
+    const warn = fallback.top10HolderPct > TOP10_HOLDER_WARN_THRESHOLD;
+    lines.push(`Top 10 Holders: ${fallback.top10HolderPct.toFixed(1)}% ${warn ? "⚠️" : "✅"}`);
+  }
+
+  if (fallback.holderCount !== null) {
+    lines.push(`Holders: ${formatCompactNumber(fallback.holderCount)}`);
+  }
+
+  lines.push("⚠️ Honeypot/tax/LP-lock checks unavailable for this chain");
 
   return lines.join("\n");
 }
@@ -550,7 +594,15 @@ async function handleNewCall(
 
   if (stats) {
     const risk = await getRugRiskData(ca.addressKind, discoveredChain, ca.address);
-    const reply = `${historyPrefix}${formatStatsCard(stats, ca.address)}\n\n${formatSecuritySection(risk, discoveredChain)}`;
+    // Blockscout is a fallback, not a replacement — only consult it when
+    // GoPlus has no coverage at all for this chain, and only for EVM chains
+    // (Blockscout doesn't cover Solana).
+    const blockscoutFallback = !risk && ca.addressKind === "evm"
+      ? await getBlockscoutFallback(discoveredChain, ca.address)
+      : null;
+    const reply = `${historyPrefix}${formatStatsCard(stats, ca.address)}\n\n${
+      formatSecuritySection(risk, blockscoutFallback, discoveredChain)
+    }`;
     await sendTelegramReply(chatId, messageId, reply, "Markdown");
 
     if (insertedCall?.id) {
