@@ -21,17 +21,21 @@ async function sendTelegramMessage(
   chatId: number,
   text: string,
   replyToMessageId?: number,
-) {
+): Promise<boolean> {
   const body: Record<string, unknown> = { chat_id: chatId, text };
   if (replyToMessageId != null) {
     body.reply_to_message_id = replyToMessageId;
     body.allow_sending_without_reply = true;
   }
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (!res.ok) {
+    console.error(`sendMessage failed (${res.status}): ${await res.text()}`);
+  }
+  return res.ok;
 }
 
 function pctChange(from: number | null, to: number | null): number | null {

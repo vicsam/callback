@@ -1,7 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { getTokenStats, shortenAddress } from "./_shared/dexscreener.ts";
-import { formatCompactNumber, formatPercent, formatPrice } from "./_shared/format.ts";
+import { escapeMarkdown, formatCompactNumber, formatPercent, formatPrice } from "./_shared/format.ts";
 
 const TELEGRAM_BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN")!;
 const TELEGRAM_WEBHOOK_SECRET = Deno.env.get("TELEGRAM_WEBHOOK_SECRET")!;
@@ -42,8 +42,8 @@ async function sendTelegramReply(
   messageId: number,
   text: string,
   parseMode?: "Markdown",
-) {
-  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+): Promise<boolean> {
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -53,6 +53,10 @@ async function sendTelegramReply(
       ...(parseMode ? { parse_mode: parseMode } : {}),
     }),
   });
+  if (!res.ok) {
+    console.error(`sendMessage failed (${res.status}): ${await res.text()}`);
+  }
+  return res.ok;
 }
 
 // --- GoPlus rug-risk data -------------------------------------------------
@@ -192,7 +196,7 @@ const EVM_CHAIN_IDS: Record<string, string> = {
 
 function formatStatsCard(stats: import("./_shared/dexscreener.ts").TokenStats, address: string): string {
   const label = stats.symbol && stats.symbol !== shortenAddress(address)
-    ? `${stats.symbol} (${shortenAddress(address)})`
+    ? `${escapeMarkdown(stats.symbol)} (${shortenAddress(address)})`
     : shortenAddress(address);
 
   return [

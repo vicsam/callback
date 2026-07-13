@@ -21,3 +21,12 @@ export function formatPercent(n: number | null): string {
   const arrow = n >= 0 ? "🔺" : "🔻";
   return `${arrow} ${n.toFixed(1)}%`;
 }
+
+// Token symbols come from DexScreener/GoPlus, which reflect on-chain
+// metadata anyone can set arbitrarily. Escape Telegram legacy-Markdown
+// special characters so an attacker-chosen symbol (e.g. containing an
+// unbalanced "*" or "_") can't break parse_mode: "Markdown" and silently
+// drop the whole message.
+export function escapeMarkdown(text: string): string {
+  return text.replace(/[_*`\[]/g, "\\$&");
+}
