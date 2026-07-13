@@ -1,0 +1,23 @@
+name: Process 24h follow-ups
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  call-process-followups:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger process-followups Edge Function
+        run: |
+          status=$(curl -s -o response.json -w "%{http_code}" -X POST \
+            "${{ secrets.PROCESS_FOLLOWUPS_URL }}" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json")
+          echo "HTTP status: $status"
+          cat response.json
+          if [ "$status" -ge 300 ]; then
+            echo "process-followups returned a non-2xx status"
+            exit 1
+          fi
