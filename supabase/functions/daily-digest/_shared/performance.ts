@@ -52,7 +52,7 @@ export async function getCallPerformance(
       .maybeSingle();
     fdvTo = followupSnapshot?.fdv ?? null;
   } else {
-    const stats = await getTokenStats(call.chain, call.ca_address);
+    const stats = await getTokenStats(call.ca_address);
     fdvTo = stats?.fdv ?? null;
     if (stats?.symbol) symbol = stats.symbol;
   }

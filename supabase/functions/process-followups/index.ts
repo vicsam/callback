@@ -107,7 +107,7 @@ Deno.serve(async (req: Request) => {
         .eq("snapshot_type", "initial")
         .maybeSingle();
 
-      const currentStats = await getTokenStats(call.chain, call.ca_address);
+      const currentStats = await getTokenStats(call.ca_address);
 
       const label = call.ca_address.length > 12
         ? `${call.ca_address.slice(0, 4)}...${call.ca_address.slice(-4)}`

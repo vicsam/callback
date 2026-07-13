@@ -26,27 +26,37 @@ export function shortenAddress(address: string): string {
   return `${address.slice(0, 4)}...${address.slice(-4)}`;
 }
 
-// DexScreener's tokens endpoint takes a chainId in the path and returns a
-// bare array of matching pairs (not wrapped in a `pairs` key). An unknown
-// or invalid address returns 200 with an empty array, not a 404.
-export async function getTokenStats(chain: string, address: string): Promise<TokenStats | null> {
-  const url = `https://api.dexscreener.com/tokens/v1/${chain}/${address}`;
+// An EVM-shaped address (0x + 40 hex) is not chain-specific — the same
+// address format can exist on Ethereum, Base, BSC, or any other EVM chain
+// (and, as observed live, sometimes even collides with an unrelated token
+// deployed at the identical address on a completely different chain, e.g.
+// PulseChain). There is no way to know which chain a dropped CA belongs to
+// from the address text alone, so we don't ask DexScreener for one chain —
+// we search the address across all chains it queries and let the response
+// tell us which chain(s) actually have it. Legacy endpoint chosen deliberately
+// over /tokens/v1/{chainId}/{address} because it doesn't require a chain
+// upfront. Response is `{schemaVersion, pairs: [...] | null}` — `pairs` is
+// null (not an empty array) when nothing matches anywhere.
+export async function getTokenStats(address: string): Promise<TokenStats | null> {
+  const url = `https://api.dexscreener.com/latest/dex/tokens/${address}`;
 
-  let pairs: any[];
+  let body: { pairs?: any[] | null };
   try {
     const res = await fetch(url);
     if (!res.ok) return null;
-    pairs = await res.json();
+    body = await res.json();
   } catch {
     return null;
   }
 
+  const pairs = body?.pairs;
   if (!Array.isArray(pairs) || pairs.length === 0) {
     return null;
   }
 
-  // A token can have multiple pairs (e.g. paired with SOL and with USDC).
-  // Report the one with the highest liquidity as canonical.
+  // A token can have multiple pairs across multiple chains and DEXes.
+  // Report the one with the highest liquidity as canonical, and trust its
+  // chainId as the token's real chain — never the regex-guessed one.
   const best = pairs.reduce((a, b) => {
     const liqA = a?.liquidity?.usd ?? 0;
     const liqB = b?.liquidity?.usd ?? 0;
@@ -55,6 +65,8 @@ export async function getTokenStats(chain: string, address: string): Promise<Tok
 
   const priceUsd = Number(best.priceUsd);
   if (!Number.isFinite(priceUsd)) return null;
+
+  const chain = best.chainId ?? "unknown";
 
   return {
     symbol: best.baseToken?.symbol ?? shortenAddress(address),

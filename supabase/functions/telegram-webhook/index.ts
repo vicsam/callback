@@ -14,9 +14,18 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const SOLANA_RE = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
 const EVM_RE = /0x[a-fA-F0-9]{40}/g;
 
+// `addressKind` is a structural classification only — "is this shaped like
+// an EVM address or a Solana address" — never a specific chain. An EVM-shaped
+// address (0x + 40 hex) is valid on Ethereum, Base, BSC, and dozens of other
+// EVM chains; there is no way to tell which one from the text alone. The
+// actual chain is discovered later from DexScreener's response (see
+// getTokenStats in _shared/dexscreener.ts) and is what actually gets stored
+// and displayed. addressKind only decides which GoPlus API shape to call
+// (Solana's and EVM's are structurally different) — it is not a source of
+// truth for chain identity.
 interface DetectedCa {
   address: string;
-  chain: "solana" | "ethereum";
+  addressKind: "solana" | "evm";
 }
 
 function detectCas(text: string): DetectedCa[] {
@@ -24,7 +33,7 @@ function detectCas(text: string): DetectedCa[] {
 
   const evmMatches = text.match(EVM_RE) ?? [];
   for (const address of evmMatches) {
-    results.push({ address, chain: "ethereum" });
+    results.push({ address, addressKind: "evm" });
   }
 
   // Strip EVM matches before running the Solana regex so a 0x... address
@@ -32,7 +41,7 @@ function detectCas(text: string): DetectedCa[] {
   const textWithoutEvm = text.replace(EVM_RE, " ");
   const solanaMatches = textWithoutEvm.match(SOLANA_RE) ?? [];
   for (const address of solanaMatches) {
-    results.push({ address, chain: "solana" });
+    results.push({ address, addressKind: "solana" });
   }
 
   return results;
@@ -84,8 +93,11 @@ interface RugRiskData {
   top10HolderPct: number | null;
 }
 
-async function getRugRiskData(chain: string, address: string): Promise<RugRiskData | null> {
-  if (chain === "solana") {
+// `chain` here must be the chain DISCOVERED from getTokenStats's DexScreener
+// response, not the addressKind guess — GoPlus needs the real chain to query
+// the right EVM network.
+async function getRugRiskData(addressKind: "solana" | "evm", chain: string, address: string): Promise<RugRiskData | null> {
+  if (addressKind === "solana") {
     return getSolanaRugRiskData(address);
   }
   return getEvmRugRiskData(chain, address);
@@ -147,7 +159,13 @@ async function getSolanaRugRiskData(address: string): Promise<RugRiskData | null
 }
 
 async function getEvmRugRiskData(chain: string, address: string): Promise<RugRiskData | null> {
-  const chainId = EVM_CHAIN_IDS[chain] ?? "1";
+  // Do NOT default an unmapped chain to Ethereum's chainId ("1") — that would
+  // silently query GoPlus for the wrong network and could return misleading
+  // data for an address that happens to collide across chains. A chain
+  // GoPlus doesn't have a mapping for (e.g. a niche appchain) should fall
+  // through to the existing "no data available" path instead.
+  const chainId = EVM_CHAIN_IDS[chain];
+  if (!chainId) return null;
   const url = `https://api.gopluslabs.io/api/v1/token_security/${chainId}?contract_addresses=${address}`;
   const result = await fetchGoPlus(url);
   if (!result) return null;
@@ -452,7 +470,7 @@ async function handleActiveDuplicate(
   ca: DetectedCa,
   priorCall: PriorCall,
 ): Promise<void> {
-  const stats = await getTokenStats(ca.chain, ca.address);
+  const stats = await getTokenStats(ca.address);
 
   const { data: initialSnapshot } = await supabase
     .from("snapshots")
@@ -510,24 +528,29 @@ async function handleNewCall(
   ca: DetectedCa,
   historyPrefix: string,
 ): Promise<void> {
+  // Fetch stats FIRST so we know the real chain before writing the `calls`
+  // row — the stored chain must be what DexScreener discovered, not the
+  // regex-derived addressKind guess (an EVM-shaped address could belong to
+  // any EVM chain).
+  const stats = await getTokenStats(ca.address);
+  const discoveredChain = stats?.chain ?? (ca.addressKind === "solana" ? "solana" : "unknown");
+
   const { data: insertedCall } = await supabase
     .from("calls")
     .insert({
       chat_id: chatId,
       message_id: messageId,
       ca_address: ca.address,
-      chain: ca.chain,
+      chain: discoveredChain,
       dropped_by_user_id: droppedByUserId,
       dropped_by_username: droppedByUsername,
     })
     .select("id")
     .single();
 
-  const stats = await getTokenStats(ca.chain, ca.address);
-
   if (stats) {
-    const risk = await getRugRiskData(ca.chain, ca.address);
-    const reply = `${historyPrefix}${formatStatsCard(stats, ca.address)}\n\n${formatSecuritySection(risk, ca.chain)}`;
+    const risk = await getRugRiskData(ca.addressKind, discoveredChain, ca.address);
+    const reply = `${historyPrefix}${formatStatsCard(stats, ca.address)}\n\n${formatSecuritySection(risk, discoveredChain)}`;
     await sendTelegramReply(chatId, messageId, reply, "Markdown");
 
     if (insertedCall?.id) {
