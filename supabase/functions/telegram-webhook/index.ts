@@ -222,6 +222,25 @@ function renouncedLabel(v: boolean | null): string {
   return v ? "renounced ✅" : "active ⚠️";
 }
 
+// "3h ago", "1d 4h ago". Rounds down to the hour; a call dropped 10 minutes
+// ago reads as "0h ago" rather than "1h ago".
+function formatHoursAgo(since: Date): string {
+  const totalMinutes = Math.max(0, Math.floor((Date.now() - since.getTime()) / 60000));
+  const totalHours = Math.floor(totalMinutes / 60);
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  if (days > 0) return `${days}d ${hours}h ago`;
+  return `${hours}h ago`;
+}
+
+function formatFdvChange(from: number | null, to: number | null): string {
+  const fromLabel = formatCompactNumber(from);
+  const toLabel = formatCompactNumber(to);
+  if (from === null || to === null || from === 0) return `$${fromLabel} → $${toLabel}`;
+  const change = ((to - from) / from) * 100;
+  return `$${fromLabel} → $${toLabel} (${change >= 0 ? "+" : ""}${change.toFixed(1)}%)`;
+}
+
 function formatSecuritySection(risk: RugRiskData | null, chain: string): string {
   if (!risk) {
     return "🔐 Security: no data available yet";
@@ -307,46 +326,147 @@ Deno.serve(async (req: Request) => {
   );
 
   for (const ca of detected) {
-    const { data: insertedCall } = await supabase
+    // Dedup lookup: has this exact CA already been called in this chat?
+    // Ordered by dropped_at desc so a chat with multiple past cycles for
+    // the same address only ever compares against the most recent one.
+    const { data: priorCall } = await supabase
       .from("calls")
-      .insert({
-        chat_id: chatId,
-        message_id: messageId,
-        ca_address: ca.address,
-        chain: ca.chain,
-        dropped_by_user_id: droppedByUserId,
-        dropped_by_username: droppedByUsername,
-      })
-      .select("id")
-      .single();
+      .select("id, status, dropped_at, dropped_by_username")
+      .eq("chat_id", chatId)
+      .eq("ca_address", ca.address)
+      .order("dropped_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-    const stats = await getTokenStats(ca.chain, ca.address);
-
-    if (stats) {
-      const risk = await getRugRiskData(ca.chain, ca.address);
-      const reply = `${formatStatsCard(stats, ca.address)}\n\n${formatSecuritySection(risk, ca.chain)}`;
-      await sendTelegramReply(chatId, messageId, reply, "Markdown");
-
-      if (insertedCall?.id) {
-        await supabase.from("snapshots").insert({
-          call_id: insertedCall.id,
-          price_usd: stats.priceUsd,
-          fdv: stats.fdv,
-          liquidity_usd: stats.liquidityUsd,
-          volume_24h: stats.volume24h,
-          price_change_1h: stats.priceChange1h,
-          price_change_24h: stats.priceChange24h,
-          snapshot_type: "initial",
-        });
-      }
-    } else {
-      await sendTelegramReply(
-        chatId,
-        messageId,
-        `⚠️ Call logged, but no market data found yet for ${ca.address} — may be too new or invalid.`,
-      );
+    if (priorCall && priorCall.status === "active") {
+      // Case A: still within the original 24h cycle — don't create a new
+      // call/snapshot, just surface a lightweight then-vs-now notice.
+      await handleActiveDuplicate(chatId, messageId, ca, priorCall);
+      continue;
     }
+
+    // Case B (prior call exists but already followed_up) and Case C (no
+    // prior call) both run the full new-call flow; Case B additionally
+    // gets a historical context line prepended to the stats card.
+    let historyPrefix = "";
+    if (priorCall && priorCall.status === "followed_up") {
+      historyPrefix = await buildHistoryPrefix(priorCall);
+    }
+
+    await handleNewCall(chatId, messageId, droppedByUserId, droppedByUsername, ca, historyPrefix);
   }
 
   return new Response("OK", { status: 200 });
 });
+
+interface PriorCall {
+  id: string;
+  status: string;
+  dropped_at: string;
+  dropped_by_username: string | null;
+}
+
+async function handleActiveDuplicate(
+  chatId: number,
+  messageId: number,
+  ca: DetectedCa,
+  priorCall: PriorCall,
+): Promise<void> {
+  const stats = await getTokenStats(ca.chain, ca.address);
+
+  const { data: initialSnapshot } = await supabase
+    .from("snapshots")
+    .select("fdv")
+    .eq("call_id", priorCall.id)
+    .eq("snapshot_type", "initial")
+    .maybeSingle();
+
+  const byLine = priorCall.dropped_by_username
+    ? `@${priorCall.dropped_by_username}`
+    : "someone";
+  const hoursAgo = formatHoursAgo(new Date(priorCall.dropped_at));
+
+  if (stats) {
+    const lines = [
+      `🔁 Already called ${hoursAgo} by ${byLine}`,
+      `Then: FDV ${formatFdvChange(initialSnapshot?.fdv ?? null, stats.fdv)}`,
+      `🔗 Chart: ${stats.chartUrl}`,
+    ];
+    await sendTelegramReply(chatId, messageId, lines.join("\n"));
+  } else {
+    await sendTelegramReply(
+      chatId,
+      messageId,
+      `🔁 Already called ${hoursAgo} by ${byLine} — no current market data found for ${ca.address}.`,
+    );
+  }
+}
+
+async function buildHistoryPrefix(priorCall: PriorCall): Promise<string> {
+  const { data: initialSnapshot } = await supabase
+    .from("snapshots")
+    .select("fdv")
+    .eq("call_id", priorCall.id)
+    .eq("snapshot_type", "initial")
+    .maybeSingle();
+
+  // This prefix is prepended to a parse_mode: "Markdown" message, and
+  // Telegram usernames may legally contain underscores — escape so a
+  // username like "vic_82" doesn't get parsed as italic markup.
+  const byLine = priorCall.dropped_by_username
+    ? `@${escapeMarkdown(priorCall.dropped_by_username)}`
+    : "someone";
+  const hoursAgo = formatHoursAgo(new Date(priorCall.dropped_at));
+  const oldFdv = formatCompactNumber(initialSnapshot?.fdv ?? null);
+
+  return `📌 Previously called ${hoursAgo} by ${byLine} — was $${oldFdv} FDV\n\n`;
+}
+
+async function handleNewCall(
+  chatId: number,
+  messageId: number,
+  droppedByUserId: number | null,
+  droppedByUsername: string | null,
+  ca: DetectedCa,
+  historyPrefix: string,
+): Promise<void> {
+  const { data: insertedCall } = await supabase
+    .from("calls")
+    .insert({
+      chat_id: chatId,
+      message_id: messageId,
+      ca_address: ca.address,
+      chain: ca.chain,
+      dropped_by_user_id: droppedByUserId,
+      dropped_by_username: droppedByUsername,
+    })
+    .select("id")
+    .single();
+
+  const stats = await getTokenStats(ca.chain, ca.address);
+
+  if (stats) {
+    const risk = await getRugRiskData(ca.chain, ca.address);
+    const reply = `${historyPrefix}${formatStatsCard(stats, ca.address)}\n\n${formatSecuritySection(risk, ca.chain)}`;
+    await sendTelegramReply(chatId, messageId, reply, "Markdown");
+
+    if (insertedCall?.id) {
+      await supabase.from("snapshots").insert({
+        call_id: insertedCall.id,
+        price_usd: stats.priceUsd,
+        fdv: stats.fdv,
+        liquidity_usd: stats.liquidityUsd,
+        volume_24h: stats.volume24h,
+        price_change_1h: stats.priceChange1h,
+        price_change_24h: stats.priceChange24h,
+        snapshot_type: "initial",
+      });
+    }
+  } else {
+    await sendTelegramReply(
+      chatId,
+      messageId,
+      `⚠️ Call logged, but no market data found yet for ${ca.address} — may be too new or invalid.`,
+    );
+  }
+}
